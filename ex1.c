@@ -4,11 +4,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-//#include <sys/types.h>
 #include <sys/wait.h>
 
 #define PROMPT '$'
-//#define BACK '&'
 #define MAX 100
 #define DONE 0
 #define FORE 1
@@ -18,152 +16,210 @@
 typedef struct job{
     char command[MAX];
     int status;
+    pid_t pid;
 }job;
 
-size_t jid = 0;
+size_t jid = 0;     // id for current job
 job jobsList[MAX];
+char pwd[MAX];      // pre working directory
+char cwd[MAX];      // current workig directory
 
-char* status(int s)
+/**
+ * @brief updates background jobs to done if finished
+ * 
+ * @param j pointer to job for update
+ * @return int - done (0) or running (!= 0)
+ */
+int updateStatus(job* j)
 {
-    switch (s)
-    {
-    case DONE:
-        return "DONE";
-        break;
-    case FORE:
-    case BACK:
-        return "RUNNING";
-        break;
-    default:
-        return "";
-        break;
-    }
+    int ret;
+    waitpid(j->pid, &ret, WNOHANG);
+    if (!ret)
+        j->status = DONE;
+    return ret;
 }
 
-void jobs(job* jobEntry)
+/**
+ * @brief builtin command - print all background running jobs
+ * 
+ */
+void jobs()
 {
+    job* currentJob = jobsList + jid;
     job* jobIter = jobsList;
-    while (jobIter <= jobEntry)
+    while (jobIter <= currentJob)
     {
-        if (jobIter->status == BACK)
-            printf("%s %s\n", jobIter->command, status(BACK));
+        if (jobIter->status == BACK && updateStatus(jobIter))
+            printf("%s\n", jobIter->command);
         jobIter++;
     }
-    jobEntry->status = DONE;
+    currentJob->status = DONE;
 }
 
-void history(job* jobEntry)
+/**
+ * @brief builtin command - print all jobs, with indication for RUNNING/DONE
+ * 
+ */
+void history()
 {
+    job* currentJob = jobsList + jid;
     job* jobIter = jobsList;
-    while (jobIter <= jobEntry)
+    while (jobIter <= currentJob)
     {
-        printf("%s %s\n", jobIter->command, status(jobIter->status));
+        if(jobIter->status == BACK)
+            updateStatus(jobIter);
+        printf("%s %s\n", jobIter->command, jobIter->status == DONE ? "DONE" : "RUNNING");
         jobIter++;
     }
-    jobEntry->status = DONE;
+    currentJob->status = DONE;
 }
 
-void cd(job* jobEntry, char* arg)
+/**
+ * @brief helper function for cd()
+ * 
+ * @param dir dest directory
+ * @return int success (0) or fail (-1)
+ */
+int myChdir(char* dir)
 {
-    printf("cd command\n");
-    jobEntry->status = DONE;
-}
-
-void execJob(job* jobEntry, char** argv, int fore)
-{
-    int stat, waited;
-    //pid_t pid = fork();
-    switch (fork())
+    int fail;
+    if(dir[1] == '\0' || dir[1] == '/')
     {
+        if(dir[0] == '~')
+            fail = chdir(getenv("HOME"));
+        else if(dir[0] == '-')
+            fail = chdir(pwd);
+        if(fail)
+            return fail;
+        if (dir[1] == '\0')
+            return 0;
+        dir += 2;
+    }
+    return chdir(dir);
+}
+
+/**
+ * @brief builtin command - change direction
+ * 
+ * @param dir dest directory
+ */
+void cd(char* dir)
+{
+    job* currentJob = jobsList + jid;
+    if (!dir)
+    {
+        printf("An error occurred\n");
+        currentJob->status = DONE;
+        return;
+    }
+    if(myChdir(dir))
+    {
+        printf("chdir failed\n");
+        chdir(cwd);
+    }
+    else
+    {
+        strcpy(pwd, cwd);
+        getcwd(cwd, MAX);
+    }
+    currentJob->status = DONE;
+}
+
+/**
+ * @brief execute not builtin commands
+ * 
+ * @param args command parsed to tokens
+ */
+void execJob(char** args)
+{
+    job* currentJob = jobsList + jid;
+    pid_t pid = fork();
     // fork fail
-    case -1:
+    if(pid < 0)
         printf("fork failed\n");
-        break;
-    // son process
-    case 0:
-        if (execvp(argv[0], argv) == -1)
+    // child process
+    else if (pid ==0)
+    {
+        if (execvp(args[0], args) == -1)
         {
             printf("exec failed\n");
             exit(-1);
         }
-        break;
-    // father process
-    default:
-        if (fore)
-            waited = wait(&stat);
-        jobEntry->status = DONE;
-        break;
+    }
+    // parent process
+    else
+    {
+        if (currentJob->status == FORE)
+        {
+            wait(NULL);
+            currentJob->status = DONE;
+        }
+        else
+            currentJob->pid = pid;
     }
 }
 
 /**
- * @brief execute command
+ * @brief controller to execute the commands
  * 
- * @param argc amount of arguments
- * @param argv arguments values
+ * @param buffer input command
  */
-void execute(int argc, char* argv[])
+void exec(char* buffer)
 {
-    // chaeck '&' - fore/back
-    int fore = strcmp(argv[argc - 1], "&");
-    char* command = argv[0];
-
-    // set jobEntry
-    job* jobEntry = &jobsList[jid];
-    strcpy(jobEntry->command, command);
-    jobEntry->status = fore ? FORE : BACK;
-    jid++;
-
-    // switch command
-    if(strcmp(command, "exit") == 0)
-        exit(0);
-    else if(strcmp(command, "jobs") == 0)
-        jobs(jobEntry);
-    else if(strcmp(command, "history") == 0)
-        history(jobEntry);
-    else if(strcmp(command, "cd") == 0)
-        if(argc > 2)
-            printf("Too many argument");
-        else
-            cd(jobEntry, argv[1]);
+    // insert current job to jobs list
+    job* currentJob = jobsList + jid;
+    strcpy(currentJob->command, buffer);
+    
+    // set argv
+    char* argv[MAX/2];
+    int argc = 0;
+    for(argv[argc] = strtok(buffer, " "); argv[++argc] = strtok(NULL, " "););
+    
+    // check '&' - fore/back
+    if(strcmp(argv[argc-1], "&") == 0)
+    {
+        argv[--argc] = NULL;
+        currentJob->command[strlen(currentJob->command)-2] = '\0';
+        currentJob->status = BACK;
+    }
     else
-        execJob(jobEntry, argv, fore);
+        currentJob->status = FORE;
+    
+    // switch command
+    if(strcmp(currentJob->command, "exit") == 0)
+        exit(0);
+    else if(strcmp(currentJob->command, "jobs") == 0)
+        jobs();
+    else if(strcmp(currentJob->command, "history") == 0)
+        history();
+    else if(strcmp(argv[0], "cd") == 0)
+        if(argc > 2)
+            printf("Too many argument\n");
+        else
+            cd(argv[1]);
+    else
+        execJob(argv);
 }
 
 /**
- * @brief shell main - I/O
+ * @brief initialization and shell I/O loop
  * 
- * @return int - exit code
+ * @return int
  */
 int main()
 {
-    char buffer[MAX][MAX];
-    char* argv[MAX];
-    for(int i = 0; i < MAX; i++)
-        argv[i] = buffer[i];
+    // init cwd - Current Working Directory
+    getcwd(cwd, MAX);
+
+    // shell - I/O loop
+    char buffer[MAX];
     while(1)
     {
         printf("%c ", PROMPT);
         fflush(stdout);
-        int argc = 0;
-        char c = 'c';
-        while(c != '\n')
-        {
-            if (scanf("%[^ \"\n]", argv[argc]))
-                argc++;
-            scanf("%c", &c);
-            if (c == '\"')
-            {
-                scanf("%[^\"]", argv[argc]);
-                scanf("%c", &c);
-                argc++;
-            }
-        }
-        argv[argc] = NULL;
-        if(argc > 0)
-            execute(argc, argv);/*
-        for(;argc-->0;)
-            printf("|%s|\n",argv[argc]);*/
+        scanf(" %[^\n]", buffer);
         fflush(stdin);
+        exec(buffer);
+        jid++;
     }
 }
